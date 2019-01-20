@@ -24,6 +24,8 @@ var (
 	dests       []string
 	currentUser string
 	maxfails    int
+	oneshot     *bool
+	getStatus   func() ([]byte, error)
 )
 
 const (
@@ -35,7 +37,7 @@ const (
 )
 
 func main() {
-	oneshot := flag.Bool("oneshot", false, "Only check one then exit. Useful for cron jobs.")
+	oneshot = flag.Bool("oneshot", false, "Only check one then exit. Useful for cron jobs.")
 	interval := flag.Int("interval", 1, "How often to check in minutes.")
 	email := flag.String("email", "blue@aquarat.co.za", "Destination e-mail.")
 	username := flag.String("username", "you@gmail.com", "Google account username (used to create credentials file).")
@@ -46,6 +48,8 @@ func main() {
 	maxFailsptr := flag.Uint("maxfails", 5, "Number of failures before a fault is reported.")
 
 	flag.Parse()
+
+	getStatus = actualGetStatus
 
 	if Iamrunning() {
 		log.Println("Application already running.")
@@ -150,31 +154,60 @@ func sendMail(message string) {
 	sender.WritePlainEmail(dests, subject, message)
 }
 
-func check(counter *int) {
-	defer recover()
+func testGetStatus() (someBytes []byte, statusErr error) {
+	return []byte(`{"warping":false,"polling":true,"downloadsStart":1,"downloadsEnd":1,"downloadsCurrent":1,"snapshotsStart":1,"snapshotsEnd":1,"snapshotsCurrent":1,"keepAlive":{"status":200,"timestamp":1548015777354,"message":"In rotation"}}`), nil
+}
 
+func actualGetStatus() (someBytes []byte, statusErr error) {
 	f, err := os.Open(`/home/` + currentUser + `/.aurad/ipc/status.json`)
 	defer f.Close()
 	if err != nil {
 		log.Println(err)
-		return
+		return nil, err
 	}
 
 	// {"warping":false,"polling":true,"downloadsStart":1,"downloadsEnd":1,"downloadsCurrent":1,"snapshotsStart":1,"snapshotsEnd":1,"snapshotsCurrent":1,"keepAlive":{"status":200,"timestamp":1548015777354,"message":"In rotation"}}
-	someBytes, err := ioutil.ReadAll(f)
+	someBytes, err = ioutil.ReadAll(f)
 	if err != nil {
 		log.Println(err)
-		return
+		return nil, err
 	}
 
-	if !strings.Contains(string(someBytes), "In rotation") {
-		*counter = *counter + 1
+	return someBytes, nil
+}
 
-		if *counter == maxfails && *counter == -1 {
+func check(counter *int) {
+	defer recover()
+
+	fail := false
+	someBytes, err := getStatus()
+
+	status := &Status{}
+	if err != nil {
+		fail = true
+	}
+
+	err = json.Unmarshal(someBytes, status)
+
+	if err != nil {
+		fail = true
+	} else {
+		if !strings.Contains(string(someBytes), "In rotation") ||
+			status.KeepAlive.Status != 200 ||
+			time.Now().Unix()*1000-status.KeepAlive.Timestamp > 120 {
+			fail = true
+		} else {
+			*counter = 0
+		}
+	}
+
+	if fail {
+		*counter = *counter + 1
+		if *counter == maxfails || *oneshot {
 			sendMail(string(someBytes))
 		}
-	} else {
-		*counter = 0
+
+		fmt.Print("!")
 	}
 
 	return
@@ -183,6 +216,22 @@ func check(counter *int) {
 const (
 	SMTPServer = "smtp.gmail.com"
 )
+
+type Status struct {
+	Warping          bool `json:"warping"`
+	Polling          bool `json:"polling"`
+	DownloadsStart   int  `json:"downloadsStart"`
+	DownloadsEnd     int  `json:"downloadsEnd"`
+	DownloadsCurrent int  `json:"downloadsCurrent"`
+	SnapshotsStart   int  `json:"snapshotsStart"`
+	SnapshotsEnd     int  `json:"snapshotsEnd"`
+	SnapshotsCurrent int  `json:"snapshotsCurrent"`
+	KeepAlive        struct {
+		Status    int    `json:"status"`
+		Timestamp int64  `json:"timestamp"`
+		Message   string `json:"message"`
+	} `json:"keepAlive"`
+}
 
 type Sender struct {
 	User     string
